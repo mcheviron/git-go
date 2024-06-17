@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"compress/zlib"
+	"crypto/sha1"
 	"fmt"
 	"io"
 	"log/slog"
@@ -56,6 +57,26 @@ func main() {
 			}
 			fmt.Print(string(b))
 		}
+	case "hash-object":
+		if len(os.Args) < 3 {
+			fmt.Println("usage: mygit hash-object [-w] <file>")
+			os.Exit(1)
+		}
+		file := os.Args[len(os.Args)-1]
+		objectContent, hash, err := hashObject(file)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error hashing object: %s\n", err)
+			os.Exit(1)
+		}
+
+		if len(os.Args) > 3 && os.Args[2] == "-w" {
+			if err := writeObject(objectContent, hash); err != nil {
+				fmt.Fprintf(os.Stderr, "Error writing object: %s\n", err)
+				os.Exit(1)
+			}
+		}
+
+		fmt.Printf("%x\n", hash)
 	default:
 		slog.Error("Unknown command", slog.String("command", command))
 		os.Exit(1)
@@ -108,3 +129,42 @@ func getBlobContent(blob []byte) []byte {
 	}
 	return blob[nullIndex+1:]
 }
+
+func hashObject(filePath string) (string, [20]byte, error) {
+	fileContent, err := os.ReadFile(filePath)
+	if err != nil {
+		return "", [20]byte{}, fmt.Errorf("failed to read file: %v", err)
+	}
+
+	objectContent := fmt.Sprintf("blob %d\x00%s", len(fileContent), fileContent)
+
+	hash := sha1.Sum([]byte(objectContent))
+	return objectContent, hash, nil
+}
+
+func writeObject(objectContent string, hash [20]byte) error {
+	hexHash := fmt.Sprintf("%x", hash)
+	dirName := hexHash[:2]
+	fileName := hexHash[2:]
+	path := filepath.Join(objDir, dirName, fileName)
+
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("failed to create object directory: %w", err)
+	}
+
+	f, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("failed to create object file: %w", err)
+	}
+	defer f.Close()
+
+	w := zlib.NewWriter(f)
+	defer w.Close()
+
+	if _, err := w.Write([]byte(objectContent)); err != nil {
+		return fmt.Errorf("failed to compress object content: %w", err)
+	}
+
+	return nil
+}
+
