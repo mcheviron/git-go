@@ -206,6 +206,9 @@ func writeObject(objectContent string, hash [20]byte) error {
 }
 
 func lsTree(hexHash string, nameOnly bool) ([]string, error) {
+	// tree <size>\0
+	// <mode> <name>\0<20_byte_sha>
+	// <mode> <name>\0<20_byte_sha>
 	path := filepath.Join(objDir, hexHash[:2], hexHash[2:])
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -251,7 +254,7 @@ func lsTree(hexHash string, nameOnly bool) ([]string, error) {
 		content = content[20:]
 
 		if nameOnly {
-			result = append(result, name)
+			result = append(result, fmt.Sprintf("%s", name))
 		} else {
 			result = append(result, fmt.Sprintf("%s %s %x", mode, name, sha))
 		}
@@ -267,14 +270,17 @@ func writeTree(path string) ([20]byte, error) {
 	// <mode> <name>\0<20_byte_sha>
 	var treeEntries [][]byte
 
+	slog.Info("Reading directory", "path", path)
 	entries, err := os.ReadDir(path)
 	if err != nil {
+		slog.Error("Failed to read directory", "error", err)
 		return [20]byte{}, fmt.Errorf("failed to read directory: %w", err)
 	}
 
 	for _, entry := range entries {
 		entryPath := filepath.Join(path, entry.Name())
 		if slices.Contains(ignoredDirs, entry.Name()) {
+			slog.Info("Ignoring directory", "path", entryPath)
 			continue
 		}
 
@@ -282,17 +288,22 @@ func writeTree(path string) ([20]byte, error) {
 		var hash [20]byte
 
 		if entry.IsDir() {
+			slog.Info("Processing directory", "path", entryPath)
 			mode = "40000"
 			hash, err = writeTree(entryPath)
 			if err != nil {
+				slog.Error("Failed to write tree object", "path", entryPath, "error", err)
 				return [20]byte{}, fmt.Errorf("failed to write tree object: %w", err)
 			}
 		} else {
-			mode = "100644"
+			slog.Info("Processing file", "path", entryPath)
 			_, hash, err = hashObject(entryPath)
 			if err != nil {
+				slog.Error("Failed to hash object", "path", entryPath, "error", err)
 				return [20]byte{}, fmt.Errorf("failed to hash object: %w", err)
 			}
+
+			mode = "100644"
 		}
 
 		entryData := []byte(fmt.Sprintf("%s %s\x00", mode, filepath.Base(entryPath)))
@@ -314,10 +325,12 @@ func writeTree(path string) ([20]byte, error) {
 	treeObject := fmt.Sprintf("tree %d\x00%s", len(flattenedTreeEntries), flattenedTreeEntries)
 	hash := sha1.Sum([]byte(treeObject))
 
+	slog.Info("Writing tree object", "hash", fmt.Sprintf("%x", hash))
 	if err := writeObject(treeObject, hash); err != nil {
+		slog.Error("Failed to write tree object", "error", err)
 		return [20]byte{}, fmt.Errorf("failed to write tree object: %w", err)
 	}
 
+	slog.Info("Tree object written successfully", "hash", fmt.Sprintf("%x", hash))
 	return hash, nil
 }
-
