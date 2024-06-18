@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 )
 
 const (
@@ -41,7 +42,10 @@ func main() {
 
 	switch command := os.Args[1]; command {
 	case "init":
-		initRepo()
+		if err := initRepo(); err != nil {
+			slog.Error("Failed to initialize repo", "err", err)
+			os.Exit(1)
+		}
 	case "cat-file":
 		if len(os.Args) < 3 {
 			fmt.Println("usage: mygit cat-file -p <hash>")
@@ -52,7 +56,7 @@ func main() {
 			hash := os.Args[3]
 			b, err := readBlob(hash)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error reading blob: %s\n", err)
+				slog.Error("Error reading blob", "err", err)
 				os.Exit(1)
 			}
 			fmt.Print(string(b))
@@ -65,43 +69,63 @@ func main() {
 		file := os.Args[len(os.Args)-1]
 		objectContent, hash, err := hashObject(file)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error hashing object: %s\n", err)
+			slog.Error("Error hashing object", "err", err)
 			os.Exit(1)
 		}
 
 		if len(os.Args) > 3 && os.Args[2] == "-w" {
 			if err := writeObject(objectContent, hash); err != nil {
-				fmt.Fprintf(os.Stderr, "Error writing object: %s\n", err)
+				slog.Error("Error writing object", "err", err)
 				os.Exit(1)
 			}
 		}
 
 		fmt.Printf("%x\n", hash)
+	case "ls-tree":
+		if len(os.Args) < 3 {
+			fmt.Println("usage: mygit ls-tree [--name-only] <hash>")
+			os.Exit(1)
+		}
+		var hexHash string
+		nameOnly := false
+		if os.Args[2] == "--name-only" {
+			nameOnly = true
+			hexHash = os.Args[3]
+		} else {
+			hexHash = os.Args[2]
+		}
+		treeEntries, err := lsTree(hexHash, nameOnly)
+		if err != nil {
+			slog.Error("Error listing tree", "err", err)
+			os.Exit(1)
+		}
+		for _, entry := range treeEntries {
+			fmt.Println(entry)
+		}
 	default:
 		slog.Error("Unknown command", slog.String("command", command))
 		os.Exit(1)
 	}
 }
 
-func initRepo() {
+func initRepo() error {
 	for _, dir := range []string{".git", ".git/objects", ".git/refs"} {
 		if err := os.MkdirAll(dir, 0755); err != nil {
-			fmt.Fprintf(os.Stderr, "Error creating directory: %s\n", err)
+			return fmt.Errorf("error creating directory: %w", err)
 		}
 	}
 
 	headFileContents := []byte("ref: refs/heads/main\n")
 	if err := os.WriteFile(".git/HEAD", headFileContents, 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "Error writing file: %s\n", err)
+		return fmt.Errorf("error writing file: %w", err)
 	}
 
 	fmt.Println("Initialized git directory")
+	return nil
 }
 
 func readBlob(hash string) ([]byte, error) {
-	dirName := hash[:2]
-	fileName := hash[2:]
-	path := filepath.Join(objDir, dirName, fileName)
+	path := filepath.Join(objDir, hash[:2], hash[2:])
 
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -144,9 +168,7 @@ func hashObject(filePath string) (string, [20]byte, error) {
 
 func writeObject(objectContent string, hash [20]byte) error {
 	hexHash := fmt.Sprintf("%x", hash)
-	dirName := hexHash[:2]
-	fileName := hexHash[2:]
-	path := filepath.Join(objDir, dirName, fileName)
+	path := filepath.Join(objDir, hexHash[:2], hexHash[2:])
 
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return fmt.Errorf("failed to create object directory: %w", err)
@@ -168,3 +190,61 @@ func writeObject(objectContent string, hash [20]byte) error {
 	return nil
 }
 
+func lsTree(hexHash string, nameOnly bool) ([]string, error) {
+	// tree <size>\0
+	// <mode> <name>\0<20_byte_sha>
+	// <mode> <name>\0<20_byte_sha>
+	path := filepath.Join(objDir, hexHash[:2], hexHash[2:])
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open file: %w", err)
+	}
+
+	r, err := zlib.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create zlib reader: %w", err)
+	}
+	defer r.Close()
+
+	decompressed, err := io.ReadAll(r)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decompress data: %w", err)
+	}
+
+	if !bytes.HasPrefix(decompressed, []byte("tree")) {
+		return nil, fmt.Errorf("object is not a tree")
+	}
+
+	nullIndex := bytes.IndexByte(decompressed, 0)
+	if nullIndex == -1 {
+		return nil, fmt.Errorf("invalid tree object format")
+	}
+	content := decompressed[nullIndex+1:]
+
+	var result []string
+	for len(content) > 0 {
+		nullIndex = bytes.IndexByte(content, 0)
+		if nullIndex == -1 {
+			break
+		}
+
+		entry := content[:nullIndex]
+		content = content[nullIndex+1:]
+
+		parts := bytes.Split(entry, []byte(" "))
+		mode := string(parts[0])
+		name := string(parts[1])
+
+		sha := content[:20]
+		content = content[20:]
+
+		if nameOnly {
+			result = append(result, fmt.Sprintf("%s", name))
+		} else {
+			result = append(result, fmt.Sprintf("%s %s %x", mode, name, sha))
+		}
+	}
+
+	sort.Strings(result)
+	return result, nil
+}
