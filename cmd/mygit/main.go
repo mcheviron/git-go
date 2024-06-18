@@ -9,12 +9,15 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 )
 
 const (
 	objDir = ".git/objects"
 )
+
+var ignoredDirs = []string{".", "..", ".git"}
 
 func init() {
 	textHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
@@ -102,6 +105,18 @@ func main() {
 		for _, entry := range treeEntries {
 			fmt.Println(entry)
 		}
+	case "write-tree":
+		if len(os.Args) < 2 {
+			fmt.Println("usage: mygit write-tree")
+			os.Exit(1)
+		}
+		hash, err := writeTree(".")
+		if err != nil {
+			slog.Error("Error writing tree", "err", err)
+			os.Exit(1)
+		}
+		fmt.Printf("%x\n", hash)
+
 	default:
 		slog.Error("Unknown command", slog.String("command", command))
 		os.Exit(1)
@@ -191,9 +206,6 @@ func writeObject(objectContent string, hash [20]byte) error {
 }
 
 func lsTree(hexHash string, nameOnly bool) ([]string, error) {
-	// tree <size>\0
-	// <mode> <name>\0<20_byte_sha>
-	// <mode> <name>\0<20_byte_sha>
 	path := filepath.Join(objDir, hexHash[:2], hexHash[2:])
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -239,7 +251,7 @@ func lsTree(hexHash string, nameOnly bool) ([]string, error) {
 		content = content[20:]
 
 		if nameOnly {
-			result = append(result, fmt.Sprintf("%s", name))
+			result = append(result, name)
 		} else {
 			result = append(result, fmt.Sprintf("%s %s %x", mode, name, sha))
 		}
@@ -248,3 +260,64 @@ func lsTree(hexHash string, nameOnly bool) ([]string, error) {
 	sort.Strings(result)
 	return result, nil
 }
+
+func writeTree(path string) ([20]byte, error) {
+	// tree <size>\0
+	// <mode> <name>\0<20_byte_sha>
+	// <mode> <name>\0<20_byte_sha>
+	var treeEntries [][]byte
+
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return [20]byte{}, fmt.Errorf("failed to read directory: %w", err)
+	}
+
+	for _, entry := range entries {
+		entryPath := filepath.Join(path, entry.Name())
+		if slices.Contains(ignoredDirs, entry.Name()) {
+			continue
+		}
+
+		var mode string
+		var hash [20]byte
+
+		if entry.IsDir() {
+			mode = "40000"
+			hash, err = writeTree(entryPath)
+			if err != nil {
+				return [20]byte{}, fmt.Errorf("failed to write tree object: %w", err)
+			}
+		} else {
+			mode = "100644"
+			_, hash, err = hashObject(entryPath)
+			if err != nil {
+				return [20]byte{}, fmt.Errorf("failed to hash object: %w", err)
+			}
+		}
+
+		entryData := []byte(fmt.Sprintf("%s %s\x00", mode, filepath.Base(entryPath)))
+		entryData = append(entryData, hash[:]...)
+		treeEntries = append(treeEntries, entryData)
+	}
+
+	// Sort the tree entries
+	sort.Slice(treeEntries, func(i, j int) bool {
+		return bytes.Compare(treeEntries[i], treeEntries[j]) < 0
+	})
+
+	// Flatten the sorted tree entries
+	var flattenedTreeEntries []byte
+	for _, entry := range treeEntries {
+		flattenedTreeEntries = append(flattenedTreeEntries, entry...)
+	}
+
+	treeObject := fmt.Sprintf("tree %d\x00%s", len(flattenedTreeEntries), flattenedTreeEntries)
+	hash := sha1.Sum([]byte(treeObject))
+
+	if err := writeObject(treeObject, hash); err != nil {
+		return [20]byte{}, fmt.Errorf("failed to write tree object: %w", err)
+	}
+
+	return hash, nil
+}
+
